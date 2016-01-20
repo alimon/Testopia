@@ -21,11 +21,14 @@ Portions created by Will Woods are Copyright (C) 2008 Red Hat.
 All Rights Reserved.
 Portions created by Bill Peck are Copyright (C) 2008 Red Hat.
 All Rights Reserved.
+Portions created by Anibal Limon are Copyright (C) 2016 Intel Corporation.
+All Rights Reserved.
 
 Contributor(s): Airald Hapairai
   David Malcolm <dmalcolm@redhat.com>
   Will Woods <wwoods@redhat.com>
   Bill Peck <bpeck@redhat.com>
+  Anibal Limon <anibal.limon@intel.com>
 
 The CookieTransport class is by Will Woods, based on code in
 Python's xmlrpclib.Transport, which has this copyright notice:
@@ -70,12 +73,12 @@ where config.cfg looks like:
 [testopia]
 username: jdoe@mycompany.com
 password: jdoepassword
-url:      https://myhost.mycompany.com/bugzilla/tr_xmlrpc.cgi
+url:      https://myhost.mycompany.com/bugzilla/xmlrpc.cgi
 
 Or, more directly:
 t = Testopia('jdoe@mycompany.com',
              'jdoepassword',
-             'https://myhost.mycompany.com/bugzilla/tr_xmlrpc.cgi')             
+             'https://myhost.mycompany.com/bugzilla/xmlrpc.cgi')
 t.testplan_get(10)
 
 though this means you've embedded your login credentials in the source file.
@@ -88,89 +91,61 @@ arguments. I've done this here with list, create, and update just to help.
 """
 
 __author__="Airald Hapairai"
-__date__="06/23/2008"
-__version__="0.2.0.0"
+__date__="20/01/2016"
+__version__="0.3.0.0"
 
-
-
+import ssl
+import os
 import xmlrpclib, urllib2
+import cookielib
+from urlparse import urlparse
+
 from types import *
 from datetime import datetime, time
 
-from cookielib import CookieJar
+class Urllib2Transport(xmlrpclib.Transport):
+    def __init__(self, opener=None, https=False, use_datetime=0):
+        xmlrpclib.Transport.__init__(self, use_datetime)
+        self.opener = opener or urllib2.build_opener()
 
-class CookieTransport(xmlrpclib.Transport):
-    '''A subclass of xmlrpclib.Transport that supports cookies.'''
-    cookiejar = None
-    scheme = 'http'
-
-    # Cribbed from xmlrpclib.Transport.send_user_agent 
-    def send_cookies(self, connection, cookie_request):
-        if self.cookiejar is None:
-            self.cookiejar = cookielib.CookieJar()
-        elif self.cookiejar:
-            # Let the cookiejar figure out what cookies are appropriate
-            self.cookiejar.add_cookie_header(cookie_request)
-            # Pull the cookie headers out of the request object...
-            cookielist=list()
-            for h,v in cookie_request.header_items():
-                if h.startswith('Cookie'):
-                    cookielist.append([h,v])
-            # ...and put them over the connection
-            for h,v in cookielist:
-                connection.putheader(h,v)
-
-    # This is the same request() method from xmlrpclib.Transport,
-    # with a couple additions noted below
     def request(self, host, handler, request_body, verbose=0):
-        h = self.make_connection(host)
-        if verbose:
-            h.set_debuglevel(1)
-
-        # ADDED: construct the URL and Request object for proper cookie handling
-        request_url = "%s://%s/" % (self.scheme,host)
-        cookie_request  = urllib2.Request(request_url) 
-
-        self.send_request(h,handler,request_body)
-        self.send_host(h,host) 
-        self.send_cookies(h,cookie_request) # ADDED. creates cookiejar if None.
-        self.send_user_agent(h)
-        self.send_content(h,request_body)
-
-        errcode, errmsg, headers = h.getreply()
-
-        # ADDED: parse headers and get cookies here
-        # fake a response object that we can fill with the headers above
-        class CookieResponse:
-            def __init__(self,headers): self.headers = headers
-            def info(self): return self.headers
-        cookie_response = CookieResponse(headers)
-        # Okay, extract the cookies from the headers
-        self.cookiejar.extract_cookies(cookie_response,cookie_request)
-        # And write back any changes
-        if hasattr(self.cookiejar,'save'):
-            self.cookiejar.save(self.cookiejar.filename)
-
-        if errcode != 200:
-            raise xmlrpclib.ProtocolError(
-                host + handler,
-                errcode, errmsg,
-                headers
-                )
-
         self.verbose = verbose
 
-        try:
-            sock = h._conn.sock
-        except AttributeError:
-            sock = None
+        proto = urlparse(self.url).scheme
+        request_uri = '%s://%s%s' % (proto, host, handler)
+        req = urllib2.Request(request_uri, request_body)
+        req.add_header('Content-Type', 'text/xml')
+        req.add_header('Content-Length', len(request_body))
+        req.add_header('User-agent', self.user_agent)
 
-        return self._parse_response(h.getfile(), sock)
+        response = self.opener.open(req)
 
-class SafeCookieTransport(xmlrpclib.SafeTransport,CookieTransport):
-    '''SafeTransport subclass that supports cookies.'''
-    scheme = 'https'
-    request = CookieTransport.request
+        return self.parse_response(response)
+
+class ProxyTransport(Urllib2Transport):
+    def __init__(self, url, sslverify, proxies=False, use_datetime=0):
+        self.url = url
+        self.cj = cookielib.CookieJar()
+
+        handlers = [urllib2.HTTPCookieProcessor(self.cj)]
+        if proxies:
+            handlers.append(urllib2.ProxyHandler()),
+        if not sslverify and hasattr(ssl, '_create_unverified_context'):
+            handlers.append(urllib2.HTTPSHandler(context=ssl._create_unverified_context()))
+        opener = urllib2.build_opener(*handlers)
+
+        Urllib2Transport.__init__(self, opener, use_datetime)
+
+def proxies_in_env():
+    exported = False
+    variables = ['http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY']
+
+    for v in variables:
+        if v in os.environ.keys():
+            exported = True
+            break
+
+    return exported
 
 VERBOSE=0
 DEBUG=0
@@ -217,7 +192,7 @@ class Testopia(object):
                        for key in ['username', 'password', 'url']])
         return Testopia(**kwargs)
     
-    def __init__(self, username, password, url):
+    def __init__(self, username, password, url, sslverify=True):
         """Initialize the Testopia driver.
 
         'username' -- string, the account to log into Testopia such as jdoe@mycompany.com,
@@ -229,12 +204,13 @@ class Testopia(object):
                               'https://myhost.mycompany.com/bugzilla/tr_xmlrpc.cgi')
         """
         if url.startswith('https://'):
-            self._transport = SafeCookieTransport()
+            self._transport = ProxyTransport(url, sslverify,
+                    proxies=proxies_in_env())
         elif url.startswith('http://'):
-            self._transport = CookieTransport()
+            self._transport = ProxyTransport(url, sslverify,
+                    proxies=proxies_in_env())
         else:
             raise "Unrecognized URL scheme"
-        self._transport.cookiejar = CookieJar()
         # print "COOKIES:", self._transport.cookiejar._cookies
         self.server = xmlrpclib.ServerProxy(url,
                                             transport = self._transport,
